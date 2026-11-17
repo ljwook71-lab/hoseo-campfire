@@ -14,6 +14,10 @@
     .touch { display: none; }
     @media (pointer: coarse) { .keyboard { display: none; } .touch { display: block; } }
     #error { position: fixed; inset: 40% 1rem auto; text-align: center; }
+    #camp-room { position: fixed; right: max(16px, env(safe-area-inset-right)); bottom: max(16px, env(safe-area-inset-bottom)); max-width: min(22rem, calc(100% - 32px)); padding: .75rem; border: 1px solid #c5a57659; border-radius: .75rem; background: #0d1729ed; }
+    #camp-room button { padding: .45rem .7rem; border: 0; border-radius: .35rem; background: #efc089; color: #24190f; font: inherit; cursor: pointer; }
+    #invite-link { display: block; width: 100%; margin-top: .5rem; }
+    #invite-link[hidden] { display: none; }
   </style>
 </head>
 <body>
@@ -22,6 +26,11 @@
     <p class="keyboard">바닥 클릭 또는 WASD · 방향키로 걷기</p>
     <p class="touch">걷고 싶은 바닥을 눌러 보세요</p>
   </header>
+  <section id="camp-room" aria-label="함께 캠핑하기">
+    <button id="invite" type="button" disabled>친구 초대</button>
+    <input id="invite-link" aria-label="캠핑장 초대 링크" type="url" readonly hidden>
+    <p id="room-status" role="status">혼자 캠핑 중</p>
+  </section>
   <p id="error" role="status" hidden>3D 화면을 불러오지 못했습니다. 인터넷 연결과 브라우저의 WebGL 지원을 확인해 주세요.</p>
   <script type="module">
     const error = document.querySelector('#error');
@@ -191,6 +200,7 @@
         feet.push(oval(doll, boots, side * .14, .14, .036, .12, .14, .17));
       }
       player.rotation.y = Math.PI;
+      const remoteDoll = doll.clone();
 
       const barbecue = new T.Group();
       barbecue.position.set(2.55, 0, -.65);
@@ -648,6 +658,133 @@
       }
 
       const clock = new T.Clock();
+      const inviteButton = document.querySelector('#invite');
+      const inviteLink = document.querySelector('#invite-link');
+      const roomStatus = document.querySelector('#room-status');
+      const guests = new Map();
+      const connectedPeers = new Set();
+      const guestCoats = [0xe9a561, 0x93a7e6, 0xd687a2, 0xb3bd73].map(color => matte(color));
+      let onlineRoom;
+      let poseAction;
+      let nextPose = 0;
+      let sendingPose = false;
+
+      function showOccupancy() {
+        roomStatus.textContent = connectedPeers.size
+          ? `함께 캠핑 중 · ${connectedPeers.size + 1}명`
+          : '친구를 기다리는 중 · 1명';
+      }
+
+      function receivePose(pose, { peerId }) {
+        if (!connectedPeers.has(peerId) || !Array.isArray(pose) || pose.length !== 6 ||
+          !pose.every(Number.isFinite)) return;
+        const [x, z, heading, stride, bob, lean] = pose;
+        if (Math.hypot(x, z) > 8.3 || Math.abs(stride) > 1 || bob < 0 || bob > .2 ||
+          Math.abs(lean) > .2) return;
+        let guest = guests.get(peerId);
+        if (!guest) {
+          const avatar = remoteDoll.clone();
+          const color = guestCoats[peerId.charCodeAt(0) % guestCoats.length];
+          for (const part of avatar.children) {
+            if (part.material === coat) part.material = color;
+          }
+          avatar.position.set(x, bob, z);
+          avatar.rotation.y = heading;
+          scene.add(avatar);
+          guest = {
+            avatar,
+            target: new T.Vector3(),
+            feet: feet.map(foot => avatar.children[doll.children.indexOf(foot)]),
+            arms: arms.map(arm => avatar.children[doll.children.indexOf(arm)])
+          };
+          guests.set(peerId, guest);
+        }
+        guest.target.set(x, bob, z);
+        Object.assign(guest, { heading, stride, lean });
+      }
+
+      async function joinCamp(code) {
+        inviteButton.disabled = true;
+        roomStatus.textContent = '캠핑장 방에 연결하는 중…';
+        try {
+          const { joinRoom } = await import('https://esm.run/trystero@0.27.0');
+          onlineRoom = joinRoom({ appId: 'ljwook71-lab/hoseo-campfire', maxReceiveBytes: 4096 }, code);
+          poseAction = onlineRoom.makeAction('camper-pose');
+          poseAction.onMessage(receivePose);
+          onlineRoom.onPeerJoin(({ peerId }) => {
+            connectedPeers.add(peerId);
+            showOccupancy();
+          }, { replay: true });
+          onlineRoom.onPeerLeave(({ peerId }) => {
+            connectedPeers.delete(peerId);
+            const guest = guests.get(peerId);
+            if (guest) scene.remove(guest.avatar);
+            guests.delete(peerId);
+            showOccupancy();
+          });
+          await onlineRoom.ready;
+          if (player.position.x === 0 && player.position.z === 4.6) {
+            player.position.x = (Math.random() - .5) * 4;
+          }
+          inviteLink.value = location.href;
+          inviteLink.hidden = false;
+          inviteButton.textContent = '초대 링크 복사';
+          showOccupancy();
+        } catch (error) {
+          if (onlineRoom) void onlineRoom.leave().catch(() => {});
+          onlineRoom = undefined;
+          poseAction = undefined;
+          roomStatus.textContent = '방에 연결하지 못했어요. 다시 시도해 주세요.';
+          console.warn(error);
+        } finally {
+          inviteButton.disabled = false;
+        }
+      }
+
+      const roomCode = () => /^#camp=([a-f0-9]{32})$/.exec(location.hash)?.[1];
+      inviteButton.disabled = false;
+      inviteButton.addEventListener('click', async () => {
+        if (!onlineRoom) {
+          const code = roomCode() ?? Array.from(crypto.getRandomValues(new Uint8Array(16)),
+            byte => byte.toString(16).padStart(2, '0')).join('');
+          history.replaceState(null, '', '#camp=' + code);
+          await joinCamp(code);
+        }
+        if (!onlineRoom) return;
+        try {
+          await navigator.clipboard.writeText(inviteLink.value);
+          roomStatus.textContent = '초대 링크를 복사했어요.';
+        } catch {
+          inviteLink.focus();
+          inviteLink.select();
+        }
+      });
+      const invitedCode = roomCode();
+      if (invitedCode) void joinCamp(invitedCode);
+      addEventListener('pagehide', event => {
+        if (!event.persisted && onlineRoom) void onlineRoom.leave().catch(() => {});
+      });
+
+      function updateGuests(dt, time, stride) {
+        const blend = 1 - Math.exp(-15 * dt);
+        for (const { avatar, target, heading, stride: step, lean, feet, arms } of guests.values()) {
+          if (avatar.position.distanceToSquared(target) > 9) avatar.position.copy(target);
+          else avatar.position.lerp(target, blend);
+          avatar.rotation.y += wrap(heading - avatar.rotation.y) * blend;
+          avatar.rotation.z = lean;
+          feet[0].position.z = .036 + step * .13;
+          feet[1].position.z = .036 - step * .13;
+          arms[0].rotation.x = step * .65;
+          arms[1].rotation.x = -step * .65;
+        }
+        if (!poseAction || !connectedPeers.size || sendingPose || time < nextPose) return;
+        nextPose = time + .085;
+        sendingPose = true;
+        const pose = [player.position.x, player.position.z, wrap(player.rotation.y),
+          stride, doll.position.y, doll.rotation.z];
+        void poseAction.send(pose).catch(() => {}).finally(() => { sendingPose = false; });
+      }
+
       let gait = 0;
       function frame() {
         const dt = Math.min(clock.getDelta(), .045);
@@ -721,6 +858,7 @@
         updateDrinking(time);
         updateEating(time);
         updateBurning(time);
+        updateGuests(dt, time, stride);
         follow(dt);
         spit.rotation.x = time * .72;
         renderer.render(scene, camera);
